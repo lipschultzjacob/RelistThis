@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "RelistThis",
+  "version": "1.0",
+  "description": "Relist Depop listings with a single click",
+  "permissions": ["storage", "scripting"],
+  "host_permissions": [
+    "https://webapi.depop.com/*",
+    "https://www.depop.com/*"
+  ],
+ 
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.depop.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
