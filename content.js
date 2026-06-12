@@ -282,6 +282,7 @@ async function createListing(token, payload) {
 
   if (!res.ok) {
     const err = await res.text();
+    console.log('create error:', err);
     throw new Error(`Failed to create listing: ${res.status} - ${err}`);
   }
 
@@ -299,13 +300,20 @@ function buildPayload(detail, newPictureIds) {
     country: detail.country || 'US',
     description: detail.description,
     gender: detail.gender,
+    geo_position_lat: 39.3812661305678,
+    geo_position_lng: -97.9222112121185,
     is_kids: detail.is_kids || false,
     national_shipping_cost: detail.national_shipping_cost || '0.00',
     picture_ids: newPictureIds,
     price_amount: detail.pricing.original_price.total_price,
     price_currency: detail.pricing.currency,
     product_type: detail.product_type,
-    shipping_methods: detail.shipping_methods || [],
+    shipping_methods: detail.shipping_methods.map(s => ({
+      payer: s.payer,
+      parcel_size: s.parcel_size_id,
+      shipping_provider_id: s.shipping_provider_id,
+      ship_from_address_id: s.ship_from_address_id,
+})),
     variant_set: detail.variant_set_id,
     variants: detail.variants || {},
     persistent_id: crypto.randomUUID(),
@@ -335,6 +343,7 @@ async function relistItem(slug, token, sendUpdate) {
   await sleep(2000 + Math.random() * 2000);
 
   sendUpdate('Reposting...');
+  console.log('payload:', JSON.stringify(payload));
   const result = await createListing(token, payload);
 
   sendUpdate('✓ Done!');
