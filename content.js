@@ -5,21 +5,18 @@
 (function () {
 
   // ── Token capture ────────────────────────────────────────────────────────────
-  const originalFetch = window.fetch;
+  function getTokenFromCookie() {
+  const match = document.cookie.match(/access_token=([^;]+)/);
+  if (match) {
+    const token = match[1];
+    chrome.storage.local.set({ depopToken: token });
+    console.log('RelistThis: token captured from cookie ✓');
+    return token;
+  }
+  return null;
+}
 
-  window.fetch = async function (...args) {
-    const [resource, config] = args;
-    const url = typeof resource === 'string' ? resource : resource?.url;
-
-    if (url && url.includes('webapi.depop.com')) {
-      const auth = config?.headers?.authorization || config?.headers?.Authorization;
-      if (auth && auth.startsWith('Bearer ')) {
-        chrome.storage.local.set({ depopToken: auth.replace('Bearer ', '') });
-      }
-    }
-
-    return originalFetch.apply(this, args);
-  };
+getTokenFromCookie();
 
   // ── Only run the rest on your shop page ──────────────────────────────────────
   const isShopPage = () => /^\/[a-z0-9_]+\/?$/i.test(location.pathname);
@@ -105,24 +102,19 @@
 
   // ── Inject relist button onto a listing card ─────────────────────────────────
   function injectButton(anchor) {
-  console.log('injectButton called for:', anchor.getAttribute('href'));
   
   if (anchor.dataset.drInjected) {
-    console.log('already injected, skipping');
     return;
   }
   anchor.dataset.drInjected = '1';
 
   const parsed = parseHref(anchor.getAttribute('href'));
-  console.log('parsed:', parsed);
   
   if (!parsed) {
-    console.log('parseHref returned null, skipping');
     return;
   }
 
   const { slug } = parsed;
-  console.log('slug:', slug);
 
   // wrap the card
   const wrap = document.createElement('div');
@@ -134,19 +126,30 @@
   btn.className = 'dr-btn';
   btn.textContent = '↺ Relist';
   btn.addEventListener('click', async (e) => {
-    e.preventDefault();
-    e.stopPropagation();
-    btn.disabled = true;
-    btn.textContent = '...';
-    showToast('Starting relist...', '', 0);
-    chrome.runtime.sendMessage({
-      type: 'RELIST_SINGLE',
-      slug,
-    });
-  });
+  e.preventDefault();
+  e.stopPropagation();
+
+  const token = getTokenFromCookie();
+  if (!token) {
+    showToast('No token — are you logged in?', 'error', 3000);
+    return;
+  }
+
+  btn.disabled = true;
+  btn.textContent = '...';
+
+  try {
+    await relistItem(slug, token, showToast);
+  } catch (err) {
+    showToast(`✗ ${err.message}`, 'error', 4000);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '↺ Relist';
+  }
+});
 
   wrap.appendChild(btn);
-  console.log('button injected for:', slug);
+  
 }
 
   // ── Listen for updates from background.js ────────────────────────────────────
@@ -178,3 +181,196 @@
   scanForCards();
 
 })();
+
+//handles all Depop API calls
+
+const BASE = 'https://webapi.depop.com';
+
+function headers(token) {
+  return {
+    'accept': '*/*',
+    'accept-language': 'en-US,en;q=0.9',
+    'authorization': `Bearer ${token}`,
+    'content-type': 'application/json',
+    'sec-fetch-site': 'same-site',
+    'sec-fetch-mode': 'cors',
+    'sec-fetch-dest': 'empty',
+    'referer': 'https://www.depop.com/',
+  };
+}
+
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
+}
+
+// Fetch full data for a single listing by its slug
+async function getListingDetail(slug, token) {
+  const res = await fetch(
+    `${BASE}/presentation/api/v1/products/by-slug/${slug}/edit-listing/`,
+    { headers: headers(token) }
+  );
+
+  if (!res.ok) throw new Error(`Failed to fetch listing: ${res.status}`);
+
+  return res.json();
+}
+
+// Step 1 — Tell Depop we're about to upload an image, get back an ID and upload URL
+async function registerImage(token) {
+  const res = await fetch(`${BASE}/api/v4/pictures/`, {
+    method: 'POST',
+    headers: headers(token),
+    body: JSON.stringify({
+      type: 'product',
+      extension: 'jpg',
+      dimensions: { width: 1280, height: 1280 }
+    }),
+  });
+
+  if (!res.ok) throw new Error(`Failed to register image: ${res.status}`);
+  return res.json(); // returns { id, upload_url }
+}
+
+// Step 2 — Fetch an existing image from Depop's CDN as raw bytes
+async function fetchImageBlob(imageUrl) {
+  const res = await fetch(imageUrl);
+  if (!res.ok) throw new Error(`Failed to fetch image: ${imageUrl}`);
+  return res.blob();
+}
+
+// Step 3 — Upload the raw bytes to S3 using the URL from step 1
+async function uploadImageToS3(uploadUrl, imageBlob) {
+  
+  const res = await fetch(uploadUrl, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'image/jpeg' },
+    body: imageBlob,
+  });
+  if (!res.ok) throw new Error(`S3 upload failed: ${res.status}`);
+}
+
+// Combines all 3 steps — takes an old image URL, returns a fresh Depop picture ID
+async function reuploadImage(token, oldImageUrl) {
+  const [registered, blob] = await Promise.all([
+    registerImage(token),
+    fetchImageBlob(oldImageUrl),
+  ]);
+  await uploadImageToS3(registered.url, blob);
+  return registered.id;
+}
+
+// Delete a listing by its product ID
+async function deleteListing(productId, token) {
+  const res = await fetch(
+    `${BASE}/presentation/api/v1/products/${productId}/`,
+    {
+      method: 'DELETE',
+      headers: headers(token),
+    }
+  );
+
+  if (!res.ok) throw new Error(`Failed to delete listing: ${res.status}`);
+}
+
+// Create a new listing
+async function createListing(token, payload) {
+  const res = await fetch(`${BASE}/presentation/api/v1/listing/products/`, {
+    method: 'POST',
+    headers: headers(token),
+    body: JSON.stringify(payload),
+  });
+
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`Failed to create listing: ${res.status} - ${err}`);
+  }
+
+  return res.json();
+}
+
+// Takes raw listing data and shapes it into what the POST endpoint expects
+function buildPayload(detail, newPictureIds) {
+  return {
+    address: detail.location || 'United States',
+    attributes: detail.attributes || {},
+    brand: detail.brand || 'unbranded',
+    colour: detail.colour || [],
+    condition: detail.condition,
+    country: detail.country || 'US',
+    description: detail.description,
+    gender: detail.gender,
+    is_kids: detail.is_kids || false,
+    national_shipping_cost: detail.national_shipping_cost || '0.00',
+    picture_ids: newPictureIds,
+    price_amount: detail.pricing.original_price.total_price,
+    price_currency: detail.pricing.currency,
+    product_type: detail.product_type,
+    shipping_methods: detail.shipping_methods || [],
+    variant_set: detail.variant_set_id,
+    variants: detail.variants || {},
+    persistent_id: crypto.randomUUID(),
+  };
+}
+
+// The main function — orchestrates the full relist flow for a single item
+async function relistItem(slug, token, sendUpdate) {
+  sendUpdate('Fetching listing data...');
+  const detail = await getListingDetail(slug, token);
+  const productId = detail.id;
+
+  const pictures = detail.pictures || [];
+  sendUpdate(`Re-uploading ${pictures.length} image(s)...`);
+
+  const newPictureIds = [];
+  for (const pic of pictures) {
+    const newId = await reuploadImage(token, pic.url);
+    newPictureIds.push(newId);
+    await sleep(500);
+  }
+
+  const payload = buildPayload(detail, newPictureIds);
+
+  sendUpdate('Deleting old listing...');
+  await deleteListing(productId, token);
+  await sleep(2000 + Math.random() * 2000);
+
+  sendUpdate('Reposting...');
+  const result = await createListing(token, payload);
+
+  sendUpdate('✓ Done!');
+  return result;
+}
+
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+
+  if (message.type === 'RELIST_SINGLE') {
+    const { slug, productId } = message;
+    const tabId = sender.tab?.id;
+
+    chrome.storage.local.get('depopToken', ({ depopToken }) => {
+      if (!depopToken) {
+        chrome.tabs.sendMessage(tabId, {
+          type: 'ERROR',
+          message: 'No token — browse Depop first'
+        });
+        return;
+      }
+
+      const sendUpdate = (msg) => {
+        chrome.tabs.sendMessage(tabId, { type: 'UPDATE', message: msg }).catch(() => {});
+      };
+
+      relistItem(slug, depopToken, sendUpdate)
+        .then(() => {
+          chrome.tabs.sendMessage(tabId, { type: 'DONE' }).catch(() => {});
+        })
+        .catch((err) => {
+          chrome.tabs.sendMessage(tabId, { type: 'ERROR', message: err.message }).catch(() => {});
+        });
+    });
+
+    sendResponse({ started: true });
+    return true;
+  }
+
+});
